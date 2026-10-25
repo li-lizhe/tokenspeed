@@ -1159,6 +1159,43 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MHA decode
+
+`gluon_mha_decode_gfx950` computes paged MHA decode with grouped-query
+attention. Full attention always splits the KV stream, and
+`gluon_mha_decode_reduce_gfx950` merges the partials by LSE; sliding-window
+attention uses its own split kernels.
+
+#### Contract
+
+- The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
+  64 or 128. FP8 queries produce a BF16 output. Sinks are supported;
+  `logit_cap` and LSE output are not.
+- Full attention takes the split count from the base CTAs (requests x KV heads
+  x query-head groups) and `max_seqlen_k`, capped at 64 splits. The count does
+  not read device-resident lengths, so graphs pass the maximum context as
+  `max_seqlen_k` and replay for any batch composition.
+
+#### Algorithm
+
+Each work-group is a single wave that owns one KV head, up to 16 of its query
+heads and one split of the request's pages. When the grid already covers
+memory latency, the split loop keeps one K/V page in flight: it copies a page
+into LDS and drains it before the next.
+
+When the split cap binds, each wave streams a long split through a 4-buffer LDS
+ring that keeps three pages in flight, provided those copies fit the 6-bit vmcnt
+(BF16 head dim 128 does not); splits shorter than the ring use the single-buffer
+loop. Page indices load in chunks two ring passes ahead, since vmcnt retires in
+issue order and a later index load would drain the ring. Ring slots past the
+split repeat its last page rather than predicating the copy, and only the last
+page is masked. The page index is made wave-uniform so each copy uses a scalar
+buffer base and loop-invariant 32-bit offsets.
+
+Every split stores its partial output and LSE, with an LSE of -inf when it has
+no tokens, so the reduce merges stored partials without reading the cache
+lengths.
+
 ### gfx950 MHA cached extension
 
 Cached attention supports grouped-query attention even when the number of

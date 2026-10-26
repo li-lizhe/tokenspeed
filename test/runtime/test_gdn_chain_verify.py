@@ -289,6 +289,8 @@ def test_chain_form_commits_like_the_mtp_verify(width):
 
     assert any("gdn_chain_verify_kernel" in name for name in replayed), replayed
     assert not any("gdn_decode_update" in name for name in replayed), replayed
+    # The conv update fills the replay payload: no q/k/v split.
+    assert not any("qkv_split" in name for name in replayed), replayed
     for (reference_conv, reference_ssm), (chain_conv, chain_ssm) in zip(
         _committed(reference_pool), _committed(chain_pool)
     ):

@@ -1991,6 +1991,8 @@ class MambaAttnBackend(AttentionBackend):
 
         query_start_loc = self.forward_metadata.query_start_loc
 
+        conv_replay = None
+        conv_rows = None
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
@@ -2026,6 +2028,20 @@ class MambaAttnBackend(AttentionBackend):
             if self.tree_verify is None and not self._verify_packed_qkv_views:
                 # A chain verifies through the dense MTP kernels (FlashInfer's).
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
+            if (
+                self.tree_verify is None
+                and self._chain_verify_form(
+                    batch_size, draft_token_num, value_dim // attn_tp_size // head_v_dim
+                )
+                is GdnChainVerifyForm.CHAIN
+            ):
+                # The chain form's conv update writes the payload and dense q/k/v rows (no split).
+                conv_replay = self._replay_inputs(
+                    layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
+                )
+                conv_rows = mixed_qkv.new_empty(mixed_qkv.shape).view(
+                    batch_size, draft_token_num, -1
+                )
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:
@@ -2047,6 +2063,8 @@ class MambaAttnBackend(AttentionBackend):
                 conv_state_indices=conv_read,
                 output_state_indices=conv_out,
                 parent_indices=self._tree_parents(batch_size),
+                out=None if conv_rows is None else conv_rows.transpose(1, 2),
+                replay_payload=conv_replay,
             )
             # needn't contiguous here.
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
@@ -2107,20 +2125,9 @@ class MambaAttnBackend(AttentionBackend):
         num_value_heads = value_split_dim // head_v_dim
 
         replay_inputs = None
-        if is_target_verify and self.replay_ssm:
-            replay = self._gdn_replay
-            layer_slot = replay.layer_ids.index(layer_id)
-            # A_log and dt_bias are model-static; copy them once per layer
-            # during warmup so CUDA graph capture records no copy nodes.
-            if layer_id not in replay.initialized_layers:
-                replay.parameters[layer_slot, 0].copy_(A_log)
-                replay.parameters[layer_slot, 1].copy_(dt_bias)
-                replay.initialized_layers.add(layer_id)
-            # A family without a beta gate (Mamba2) repeats a in the unused b slot.
-            replay_inputs = (
-                replay.payload[layer_slot, :seq_len],
-                a.view(seq_len, -1),
-                (a if b is None else b).view(seq_len, -1),
+        if is_target_verify and self.replay_ssm and conv_replay is None:
+            replay_inputs = self._replay_inputs(
+                layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
             )
 
         # GDN's chunked tree verify (no node states) fills the replay payload as it reads k/v/a/b.
@@ -2136,7 +2143,11 @@ class MambaAttnBackend(AttentionBackend):
         # replay is enabled, the split kernel also saves the persistent inputs
         # needed to reconstruct accepted state later.
         if (
-            (self._verify_packed_qkv_views or scan_replay is not None)
+            (
+                self._verify_packed_qkv_views
+                or scan_replay is not None
+                or conv_replay is not None
+            )
             and replay_inputs is None
             and mixed_qkv.stride(-1) == 1
             and is_target_verify
@@ -2240,6 +2251,31 @@ class MambaAttnBackend(AttentionBackend):
                 )
 
         return core_attn_out
+
+    def _replay_inputs(
+        self,
+        layer_id: int,
+        seq_len: int,
+        a: torch.Tensor,
+        b: torch.Tensor | None,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """This layer's ReplaySSM payload rows and the gate rows they save."""
+        replay = self._gdn_replay
+        layer_slot = replay.layer_ids.index(layer_id)
+        # Model-static A_log and dt_bias copy once per layer in warmup, so capture records no copy.
+        if layer_id not in replay.initialized_layers:
+            replay.parameters[layer_slot, 0].copy_(A_log)
+            replay.parameters[layer_slot, 1].copy_(dt_bias)
+            replay.initialized_layers.add(layer_id)
+        # A family without a beta gate (Mamba2) repeats a in the unused b slot.
+        return (
+            replay.payload[layer_slot, :seq_len],
+            a.view(seq_len, -1),
+            (a if b is None else b).view(seq_len, -1),
+        )
 
     def _verify(
         self,
@@ -2384,7 +2420,7 @@ class MambaAttnBackend(AttentionBackend):
             and self._chain_verify_form(batch_size, draft_token_num, num_value_heads)
             is GdnChainVerifyForm.CHAIN
         ):
-            # Whole chain windows from the committed pages; the split filled the payload.
+            # Whole chain windows from the committed pages; the conv update filled the payload.
             return gdn_chain_verify(
                 query_b,
                 key_b,

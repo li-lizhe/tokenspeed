@@ -30,8 +30,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.attention.gdn import (
+    GdnChainVerifyForm,
     GdnStateCheckpoints,
-    gdn_chain_verify_is_chunked,
+    gdn_chain_verify,
+    gdn_chain_verify_form,
+    gdn_chain_verify_supported,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -44,6 +47,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
     build_causal_conv1d_prefill_metadata,
     fused_qkv_split_gdn_prefill,
+    gdn_chain_verify_warm_batch_sizes,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     prepare_prefill_state_inputs as _prepare_cache_prefill_state_inputs,
@@ -298,6 +302,8 @@ class MambaAttnBackend(AttentionBackend):
     # Whether the family's prefill scan stores in-forward State checkpoints
     # (SchedulerConfig::state_checkpoint_in_forward).
     _stores_in_forward_state_checkpoints: bool = False
+    # Whether the family's verify scan may run GDN's chain form (gdn_chain_verify).
+    _verify_scan_runs_chain_form: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -625,6 +631,7 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
+        self._warm_chain_verify(max_bs, draft_token_num)
         total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
@@ -637,6 +644,54 @@ class MambaAttnBackend(AttentionBackend):
         if self._tree_node_states is not None:
             total += self._tree_node_states.nbytes
         return total
+
+    def _warm_chain_verify(self, max_bs: int, width: int) -> None:
+        """Compile the chain verify's launch tiers up to ``max_bs`` (all-padding launches)."""
+        if not self.replay_ssm or self.draft_tree:
+            return
+        num_k_heads, num_v_heads, head_k_dim, head_v_dim = self._gdn_replay.geometry
+        sizes = gdn_chain_verify_warm_batch_sizes(
+            (
+                bs
+                for bs in range(1, max_bs + 1)
+                if self._chain_verify_form(bs, width, num_v_heads)
+                is GdnChainVerifyForm.CHAIN
+            ),
+            num_v_heads,
+            width,
+        )
+        if not sizes:
+            return
+        _, ssm = self._state_components(self._state_layer_ids()[0])
+        rows = sizes[-1] * width
+        # Dense rows, as the split writes q/k/v (the gates' layout is not specialized).
+        query = torch.zeros(
+            (rows, num_k_heads, head_k_dim), dtype=self.dtype, device=self.device
+        )
+        value = torch.zeros(
+            (rows, num_v_heads, head_v_dim), dtype=self.dtype, device=self.device
+        )
+        gates = torch.zeros((rows, num_v_heads), dtype=self.dtype, device=self.device)
+        parameters = torch.zeros(num_v_heads, dtype=torch.float32, device=self.device)
+        padding = torch.full(
+            (sizes[-1],), self.pad_slot_id, dtype=torch.int32, device=self.device
+        )
+        for bs in sizes:
+            tokens = bs * width
+            q = query[:tokens].view(bs, width, num_k_heads, head_k_dim)
+            gdn_chain_verify(
+                q,
+                q,
+                value[:tokens].view(bs, width, num_v_heads, head_v_dim),
+                A_log=parameters,
+                a=gates[:tokens].view(bs, width, num_v_heads),
+                dt_bias=parameters,
+                b=gates[:tokens].view(bs, width, num_v_heads),
+                initial_state=ssm,
+                initial_state_indices=padding[:bs],
+                scale=None,
+                use_qk_l2norm=True,
+            )
 
     def _verify_copy_tables_get(self) -> dict[str, torch.Tensor | int | None]:
         """Pointer tables for the batched verify state copies and replay:
@@ -761,12 +816,13 @@ class MambaAttnBackend(AttentionBackend):
         self, bs: int, draft_token_num: int, num_value_heads: int
     ) -> torch.Tensor | None:
         """Ancestor masks for the GDN verify: the draft tree's, or a ReplaySSM
-        chain's where it verifies in the chunked form (a one-path tree).
+        chain's where it verifies in the tree form (a one-path tree).
         Memoized per (bs, T): CUDA-graph capture records the tensor's storage."""
         if self.tree_verify is not None:
             return self.tree_verify.mask.view(-1, self.tree_verify.num_nodes)[:bs]
-        if not self.replay_ssm or not gdn_chain_verify_is_chunked(
-            draft_token_num, bs * num_value_heads
+        if (
+            self._chain_verify_form(bs, draft_token_num, num_value_heads)
+            is not GdnChainVerifyForm.TREE
         ):
             return None
         key = (bs, draft_token_num)
@@ -776,6 +832,20 @@ class MambaAttnBackend(AttentionBackend):
             ancestors = ((1 << (steps + 1)) - 1).repeat(bs, 1)
             self._chain_ancestors_cache[key] = ancestors
         return ancestors
+
+    def _chain_verify_form(
+        self, bs: int, width: int, num_value_heads: int
+    ) -> GdnChainVerifyForm:
+        """The verify form of ``bs`` chains of ``width`` rows, from the shape alone."""
+        if not self.replay_ssm:
+            return GdnChainVerifyForm.STEP
+        state_shape, state_dtype = self._state_layer_geometry[0][3:]
+        chain_form = self._verify_scan_runs_chain_form and gdn_chain_verify_supported(
+            state_shape[-1], state_shape[-2], state_dtype
+        )
+        return gdn_chain_verify_form(
+            width, bs * num_value_heads, state_dtype, chain_form=chain_form
+        )
 
     def _pack_projection(
         self,
@@ -2308,6 +2378,26 @@ class MambaAttnBackend(AttentionBackend):
         value_b = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
         a_b = a.view(batch_size, draft_token_num, -1)
         b_b = b.view(batch_size, draft_token_num, -1)
+
+        if (
+            self.tree_verify is None
+            and self._chain_verify_form(batch_size, draft_token_num, num_value_heads)
+            is GdnChainVerifyForm.CHAIN
+        ):
+            # Whole chain windows from the committed pages; the split filled the payload.
+            return gdn_chain_verify(
+                query_b,
+                key_b,
+                value_b,
+                A_log=A_log,
+                a=a_b,
+                dt_bias=dt_bias,
+                b=b_b,
+                initial_state=ssm_comp,
+                initial_state_indices=state_in_blocks[:batch_size],
+                scale=None,
+                use_qk_l2norm=True,
+            ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
         intermediate_states = None
         output_state = None

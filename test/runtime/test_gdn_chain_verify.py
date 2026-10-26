@@ -60,12 +60,16 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 
-if not current_platform().is_blackwell:
-    pytest.skip(
-        "the chain form is measured and selected on Blackwell", allow_module_level=True
-    )
-if not gdn_replay_commit_supported(torch.bfloat16):
-    pytest.skip("GDN ReplaySSM kernel unavailable", allow_module_level=True)
+pytestmark = [
+    pytest.mark.skipif(
+        not current_platform().is_blackwell,
+        reason="the chain form is measured and selected on Blackwell",
+    ),
+    pytest.mark.skipif(
+        not gdn_replay_commit_supported(torch.bfloat16),
+        reason="GDN ReplaySSM kernel unavailable",
+    ),
+]
 
 DEV = "cuda"
 LAYERS = (0, 1)

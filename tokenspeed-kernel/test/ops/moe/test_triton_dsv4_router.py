@@ -148,7 +148,7 @@ def test_router_matches_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("experts", [256, 384])
-@pytest.mark.parametrize("tokens", [1, 16, 17])
+@pytest.mark.parametrize("tokens", [1, 16, 17, 256])
 def test_fused_router_matches_logits_path(experts: int, tokens: int) -> None:
     torch.manual_seed(experts + tokens)
     x = torch.randn(tokens, 4096, device="cuda").bfloat16()

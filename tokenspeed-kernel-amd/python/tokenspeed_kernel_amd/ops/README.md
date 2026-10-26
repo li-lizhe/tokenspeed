@@ -1198,9 +1198,39 @@ lengths.
 
 ### gfx950 MHA cached extension
 
-Cached attention supports grouped-query attention even when the number of
-query heads per KV head is not a power of two. Multi-token extensions preserve
-the masking semantics of full and sliding-window attention.
+`gluon_mha_extend_gfx950` computes paged MHA attention for multi-token queries
+over cached keys, as in prefix-cached and chunked prefill. When the grid is
+short of work-groups, full attention splits the KV stream with
+`gluon_mha_extend_split_gfx950`, and `gluon_mha_extend_reduce_gfx950` merges
+the partials by LSE.
+
+#### Contract
+
+- The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
+  64 or 128. Query heads per KV head need not be a power of two. Full,
+  causal and sliding-window masking, sinks and LSE output are supported;
+  `logit_cap` is not.
+- The split count comes from the query blocks and `max_seqlen_k`, not from
+  device-resident lengths, so graphs replay for any batch composition.
+  Sliding-window attention does not split.
+
+#### Algorithm
+
+Each work-group owns one KV head and packs its query-head group with up to 16
+query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
+two when no request has more than 64 queries. Unused head lanes are masked.
+
+K and V pages stream into LDS through a 4-buffer ring that keeps three pages
+in flight per wave, provided the ring fits two work-groups per CU (head dim
+64). Split launches always use it. Unsplit ones use it only if the ring's
+lower residency adds no round of work-groups: the single-buffer kernel fits
+three per CU. Ranges shorter than the ring also use one buffer. Page indices
+load in chunks two ring passes ahead, since vmcnt retires in issue order and a
+later index load would drain the ring. Ring slots past the range repeat its
+last page rather than predicating the copy, and their compute is skipped; only
+pages that cross the range end, a causal diagonal or a window edge are masked.
+The page index is made wave-uniform so each copy uses a scalar buffer base and
+loop-invariant 32-bit offsets.
 
 ### gfx950 MLA extend
 

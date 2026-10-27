@@ -1030,7 +1030,15 @@ class ServerArgs:
             if current_platform().is_nvidia:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
-                self.sampling_backend = "ascend_full"
+                # ``ascend_full`` runs operators that ship with flash-npu-kernel,
+                # not with this repository. Select it only where those operators
+                # are importable; otherwise ``greedy`` is what the Ascend recipe
+                # uses and what a source checkout can actually run.
+                self.sampling_backend = (
+                    "greedy"
+                    if _ascend_full_sampling_dependency_error() is not None
+                    else "ascend_full"
+                )
             else:
                 self.sampling_backend = "greedy"
 
@@ -2317,10 +2325,10 @@ class ServerArgs:
                     "--sampling-backend ascend_full runs the npu_sample operators from "
                     "flash-npu-kernel (flash_ops), which this repository neither ships nor "
                     f"installs, and they are not importable here: {dependency_error}. Install "
-                    "flash-npu-kernel built with those operators and a matching OPP, or pass "
-                    "--sampling-backend greedy, the backend docs/recipes/models.md uses on an "
-                    "Ascend NPU. greedy performs argmax, so it ignores per-request "
-                    "temperature/top_p/top_k."
+                    "flash-npu-kernel built with those operators and a matching OPP, or drop "
+                    "the flag: the default on an Ascend NPU is then --sampling-backend greedy "
+                    "(the backend docs/recipes/models.md uses), which performs argmax and so "
+                    "ignores per-request temperature/top_p/top_k."
                 )
 
         self.validate_petit_moe_options()
@@ -3174,7 +3182,8 @@ class ServerArgs:
             "with Triton Gumbel-Max for single-step sampling. "
             "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Runs the npu_sample operators from flash-npu-kernel (flash_ops), which this "
-            "repository neither ships nor installs. "
+            "repository neither ships nor installs; the Ascend default is this backend "
+            "only where they are importable, and greedy otherwise. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
         )

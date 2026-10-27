@@ -26,6 +26,7 @@ machine without them the launch is refused while its arguments are validated.
 
 import os
 import sys
+from unittest import mock
 
 import pytest
 
@@ -63,3 +64,38 @@ def test_backend_without_those_operators_starts_regardless():
     args = ServerArgs(model="x", sampling_backend="greedy")
 
     assert args.sampling_backend == "greedy"
+
+
+def _as_npu_platform():
+    """Report the running platform as an Ascend NPU and NVIDIA as absent."""
+
+    class _NpuPlatform:
+        is_nvidia = False
+        is_npu = True
+
+    return mock.patch(
+        "tokenspeed.runtime.utils.server_args.current_platform",
+        return_value=_NpuPlatform(),
+    )
+
+
+def test_npu_default_falls_back_to_greedy_without_those_operators():
+    """The NPU default must be runnable from a plain source checkout."""
+    if _flash_ops_installed():
+        pytest.skip("flash_ops is installed, so ascend_full stays the default")
+
+    with _as_npu_platform():
+        args = ServerArgs(model="x")
+
+    assert args.sampling_backend == "greedy"
+
+
+def test_npu_default_stays_ascend_full_when_the_operators_are_importable():
+    """When the package is present, the sampling-respecting default is kept."""
+    if not _flash_ops_installed():
+        pytest.skip("flash_ops is missing, so the fallback is the expected default")
+
+    with _as_npu_platform():
+        args = ServerArgs(model="x")
+
+    assert args.sampling_backend == "ascend_full"
